@@ -59,7 +59,15 @@ class DVRouter(DVRouterBase):
         self.table.owner = self
 
         ##### Begin Stage 10A #####
-        
+        # 如果 force=False，你只应当在某个端口上通告一条路由，
+        # 当且仅当该路由与之前你通过该端口发送的路由不同，
+        # 或者你之前从未通过该端口发送过该路由。
+        # router is different 
+        # 如何分辨 router 是不同的？
+        # 通过 latency 在同样的 destination 同样的 port 的情况下
+        # 通过 latency 分辨不同的 router
+        from collections import defaultdict
+        self.history = defaultdict(dict) # port, dst
         ##### End Stage 10A #####
 
     def add_static_route(self, host, port):
@@ -78,7 +86,6 @@ class DVRouter(DVRouterBase):
         assert port in self.ports.get_all_ports(), "Link should be up, but is not."
 
         ##### Begin Stage 1 #####
-        DIRECT_LATENCY = 0.1
         self.table[host] = TableEntry(
             dst = host,
             port = port,
@@ -109,11 +116,29 @@ class DVRouter(DVRouterBase):
         if packet.dst not in self.table:
             return 
         
-        if self.table[packet.dst].latency >= INFINITY:
+        entry = self.table[packet.dst]
+        if entry.latency >= INFINITY:
             return
         
-        self.send(packet, port=self.table[packet.dst].port)
+        self.send(packet, port = entry.port)
         ##### End Stage 2 #####
+
+    
+    def _send_route(self, port, destination, latency, force=False):
+        """
+        Helper method to deal with force == False
+        If note force, 
+        you will update the only advertise a route out of a port 
+        if the route is different from what you previously sent along that port, 
+        or if you haven’t previously sent that route along that port before.
+        """
+        if not force:
+            if self.history[port].get(destination, None) == latency:
+                return
+        # force is True
+        # send to everyone
+        self.send_route(port, destination, latency)
+        self.history[port][destination] = latency
 
     def send_routes(self, force=False, single_port=None):
         """
@@ -137,38 +162,20 @@ class DVRouter(DVRouterBase):
         """
         # 这里是更新self的所有邻居
         ##### Begin Stages 3, 6, 7, 8, 10 #####
-        if not force:
-            return
-        if self.SPLIT_HORIZON and self.POISON_REVERSE:
-            return
-        ports = self.ports.get_all_ports()
-        if self.SPLIT_HORIZON:
-            for routers in self.table.values():
-                for p in ports:
-                    if p == routers.port:
-                        continue
-                    else:
-                        if routers.latency >= INFINITY:
-                            self.send_route(p, routers.dest, INFINITY)
-                        else:
-                            self.send_route(p, routers.dst, routers.latency)
-        elif self.POISON_REVERSE:
-            for routers in self.table.values():
-                for p in ports:
-                    if p == routers.port:
-                        self.send_route(p, routers.dst, INFINITY)
-                    else:
-                        if routers.latency >= INFINITY:
-                            self.send_route(p, routers.dst, INFINITY)
-                        else:
-                            self.send_route(p, routers.dst, routers.latency)
+        if single_port is not None:
+            ports = single_port
         else:
-            for routers in self.table.values():
-                for p in ports:
-                    if routers.latency >= INFINITY:
-                        self.send_route(p, routers.dst, INFINITY)
-                    else:
-                        self.send_route(p, routers.dst, routers.latency)
+            ports = self.ports.get_all_ports()
+        for routers in self.table.values():
+            for p in ports:
+                if p == routers.port:
+                    if self.SPLIT_HORIZON:
+                        continue
+                    elif self.POISON_REVERSE:
+                        self._send_route(p, routers.dst, INFINITY, force)
+                        continue
+                latency = min(INFINITY, routers.latency)
+                self._send_route(p, routers.dst, latency, force)
         ##### End Stages 3, 6, 7, 8, 10 #####
 
     def expire_routes(self):
@@ -226,12 +233,17 @@ class DVRouter(DVRouterBase):
 
         if route_dst not in self.table:
             self.table[route_dst] = new_entry
+            self.send_routes(force=False)
         else:
             entry = self.table[route_dst]
             if port == entry.port:
                 self.table[route_dst] = new_entry
+                self.send_routes(force=False)
             elif new_latency < entry.latency:
                 self.table[route_dst] = new_entry
+                self.send_routes(force=False)
+            else:
+                pass
         ##### End Stages 4, 10 #####
 
     def handle_link_up(self, port, latency):
@@ -245,7 +257,8 @@ class DVRouter(DVRouterBase):
         self.ports.add_port(port, latency)
 
         ##### Begin Stage 10B #####
-
+        if self.SEND_ON_LINK_UP:
+            self.send_routes(force=False, single_port=port)
         ##### End Stage 10B #####
 
     def handle_link_down(self, port):
@@ -258,7 +271,26 @@ class DVRouter(DVRouterBase):
         self.ports.remove_port(port)
 
         ##### Begin Stage 10B #####
+        affected = [entry for entry in self.table.values() if entry.port == port]
+        
+        if self.POISON_ON_LINK_DOWN:
+            for entry in affected:
+                new_entry = TableEntry(
+                    dst = entry.dst,
+                    port = entry.port,
+                    latency = INFINITY,
+                    expire_time = api.current_time() + float(self.ROUTE_TTL)
+                )
+                self.table[entry.dst] = new_entry
 
+            if affected:
+                # don't sent to everyone
+                self.send_routes(force=False)
+
+        else:
+            for router in affected:
+                self.table.pop(router.dst)
+                
         ##### End Stage 10B #####
 
     # Feel free to add any helper methods!
