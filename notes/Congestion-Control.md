@@ -201,7 +201,11 @@ Congestion control and reliability are intertwined.
 
 蜻蜓队长
 
-## ECN bit
+## ECN
+
+(Explicit Congestion Notification) bit
 
 提前告知 congestion
+
+比如设定一个阈值 当队列中的packet 达到70% 那就可以说将要拥塞
 
